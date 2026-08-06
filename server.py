@@ -36,12 +36,20 @@ from collector import BossCollector, collect_batch  # noqa: E402
 BASE_DIR = Path(__file__).resolve().parent
 STORAGE_DIR = BASE_DIR / "storage"
 STORAGE_STATE = BASE_DIR / "storage" / "state.json"
+# 持久化浏览器 profile（登录态最稳，优先使用）
+CHROME_PROFILE = BASE_DIR / "storage" / "chrome-profile"
 
 mcp = FastMCP("boss-zhipin")
 
 
 def _new_collector() -> BossCollector:
-    """创建独立采集器实例（每个调用一个，运行于独立线程）。"""
+    """创建独立采集器实例（每个调用一个，运行于独立线程）。
+
+    优先使用持久化 Chrome profile（user_data_dir），登录态/验证状态
+    天然保留；不存在时回退到 storage_state 登录态文件。
+    """
+    if CHROME_PROFILE.exists():
+        return BossCollector(user_data_dir=str(CHROME_PROFILE), headless=False)
     return BossCollector(storage_state=str(STORAGE_STATE), headless=False)
 
 

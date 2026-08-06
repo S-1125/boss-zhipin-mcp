@@ -78,9 +78,11 @@ class JobDetail:
 class BossCollector:
     """BOSS 直聘采集器。所有公开方法均为同步调用。"""
 
-    def __init__(self, storage_state: Optional[str] = None, headless: bool = False):
+    def __init__(self, storage_state: Optional[str] = None, headless: bool = False,
+                 user_data_dir: Optional[str] = None):
         self.storage_state = storage_state
         self.headless = headless
+        self.user_data_dir = user_data_dir
         self._pw = None
         self._browser: Optional[Browser] = None
         self._page: Optional[Page] = None
@@ -91,6 +93,17 @@ class BossCollector:
             return self._page
         self._pw = sync_playwright().start()
         launch_kwargs = {"channel": "chrome", "headless": self.headless}
+        if self.user_data_dir:
+            # 持久化浏览器 profile：登录态/验证状态都保留，最稳健
+            self._browser = self._pw.chromium.launch_persistent_context(
+                user_data_dir=self.user_data_dir,
+                headless=self.headless,
+                channel="chrome",
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+            )
+            self._page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
+            return self._page
         if self.storage_state and Path(self.storage_state).exists():
             launch_kwargs["storage_state"] = self.storage_state
         self._browser = self._pw.chromium.launch(**launch_kwargs)
@@ -130,48 +143,109 @@ class BossCollector:
             return []
 
     # ---- 登录 ----
-    def login(self, timeout_sec: int = 300) -> dict:
-        """打开浏览器窗口，用户手动扫码/验证码登录，成功后保存 storage_state。"""
+    def login(self, timeout_sec: int = 420) -> dict:
+        """打开浏览器窗口，用户手动扫码/验证码登录，成功后保存登录态。
+
+        设计要点（避免触发风控）:
+        - 打开稳定的官网首页，而不是职位列表页（列表页未登录时会反复重定向刷新）
+        - 全程不主动刷新/跳转，只做只读轮询（DOM + cookies）
+        - 登录成功信号: 登录弹窗消失 + 页面出现用户元素 + BOSS 登录 cookie
+        - 支持 persistent profile（user_data_dir）或 storage_state 两种持久化
+        """
         if self.storage_state and Path(self.storage_state).exists():
-            # 复用已有登录态，验证是否仍有效
+            # 复用已有登录态，验证是否仍有效（打开首页，不做任何交互）
             self._page = self._ensure_browser()
-            self._page.goto(f"{BASE_URL}/web/geek/job", timeout=30000)
-            self._delay(2, 4)
-            if self._is_logged_in(self._page):
-                return {"status": "ok", "message": "已有有效登录态，无需重新登录"}
+            try:
+                self._page.goto(f"{BASE_URL}/", timeout=30000, wait_until="domcontentloaded")
+                self._delay(2, 4)
+                if self._is_logged_in(self._page):
+                    return {"status": "ok", "message": "已有有效登录态，无需重新登录"}
+            except Exception as e:
+                logger.warning("登录态校验异常: %s", e)
             logger.info("登录态已失效，需要重新登录")
             self.close()
 
         page = self._ensure_browser()
-        page.goto(f"{BASE_URL}/web/geek/job", timeout=60000)
+        # 1) 打开官网首页（稳定页，无重定向循环）
+        page.goto(f"{BASE_URL}/", timeout=60000, wait_until="domcontentloaded")
+        self._delay(3, 5)
+
+        # 2) 尝试点击页面上的登录入口（若已自动弹出登录弹窗则跳过）
+        try:
+            login_btn = page.query_selector(
+                "a[href*='login'], .login-btn, .btn-login, .login-button, "
+                ".login-panel .btn, [class*='login'] a"
+            )
+            if login_btn:
+                login_btn.click()
+                self._delay(2, 3)
+        except Exception:
+            pass
+
         logger.info("请在打开的浏览器窗口中完成登录（扫码或验证码）...")
         deadline = time.time() + timeout_sec
+        last_status = ""
         while time.time() < deadline:
-            self._delay(3, 5)
+            self._delay(4, 6)
             try:
-                if self._is_logged_in(page):
-                    if self.storage_state:
-                        ctx = page.context
-                        ctx.storage_state(path=self.storage_state)
-                    return {"status": "ok", "message": f"登录成功，登录态已保存至 {self.storage_state}"}
-            except Exception:
+                # 只读检测，绝不 reload / goto
+                url = page.url
+                status = "url=" + url[:60]
+                if "login" in url or "passport" in url:
+                    status += " [登录页]"
+                elif page.query_selector(".login-panel, #wrap-login, .login-box"):
+                    status += " [登录弹窗]"
+                # BOSS 登录态 cookie 检查
+                cookies = {c["name"]: c.get("value", "")[:8] for c in page.context.cookies()}
+                has_auth_cookie = any(
+                    k in cookies for k in ("__zp_stoken__", "zp_token", "t", "wbg")
+                ) and "login" not in url
+                if self._is_logged_in(page) and has_auth_cookie:
+                    # 登录成功：持久化登录态
+                    if self.user_data_dir:
+                        # persistent profile 已自动保存，无需额外操作
+                        saved = self.user_data_dir
+                    elif self.storage_state:
+                        page.context.storage_state(path=self.storage_state)
+                        saved = self.storage_state
+                    else:
+                        saved = None
+                    return {"status": "ok",
+                            "message": f"登录成功，登录态已保存至 {saved}",
+                            "detected": status}
+                status += " [等待中]"
+                if status != last_status:
+                    logger.info("登录检测: %s", status)
+                    last_status = status
+            except Exception as e:
+                logger.debug("登录轮询异常(忽略): %s", e)
                 continue
         return {"status": "timeout", "message": f"等待登录超时（{timeout_sec}s），请重试"}
 
     @staticmethod
     def _is_logged_in(page: Page) -> bool:
-        """通过页面特征判断登录态。BOSS 未登录时会跳转登录引导。"""
+        """通过页面特征判断登录态（兼容首页与职位列表页）。"""
         url = page.url
         if "login" in url or "passport" in url:
             return False
-        # 已登录特征：页面出现"职位"列表或右上角头像/用户名
         try:
-            for sel in [
-                ".job-list-box",            # 职位列表容器
-                ".job-card-wrapper",        # 职位卡片
-                ".user-nav",                # 用户导航
-                ".job-search",              # 搜索区
-            ]:
+            # 1) 已登录特征：用户导航/头像（首页、列表页通用）
+            for sel in (
+                ".user-info", ".user-nav", ".user-logo", ".user-avatar",
+                "a[href*='/web/user/']", ".header-user-info",
+                ".user-name", ".user-center",
+            ):
+                if page.query_selector(sel):
+                    return True
+            # 2) 未登录特征：页面上存在"登录"按钮/入口
+            for sel in (
+                "a[href*='login']", ".btn-login", ".login-btn",
+                ".login-tip", ".header-login",
+            ):
+                if page.query_selector(sel):
+                    return False
+            # 3) 职位列表容器（列表页兜底）
+            for sel in (".job-list-box", ".job-card-wrapper", ".job-card"):
                 if page.query_selector(sel):
                     return True
         except Exception:
