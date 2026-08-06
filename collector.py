@@ -32,6 +32,20 @@ logger = logging.getLogger("boss")
 
 BASE_URL = "https://www.zhipin.com"
 
+# 反自动化检测参数：BOSS 直聘的 JS 会检测 webdriver 等自动化特征，
+# 检测到后会把页面清空/跳转（表现为 url 变 about:blank）。
+# channel=chrome 时仍需显式关闭 AutomationControlled 特性。
+# 同时禁用 Chrome 的会话恢复/首次运行气泡，避免出现多余空白标签页
+# （多次异常退出后 Chrome 会恢复历史标签，用户看到的可能是 about:blank 而非登录页）。
+STEALTH_ARGS = [
+    "--disable-blink-features=AutomationControlled",
+    "--disable-features=AutomationControlled",
+    "--no-first-run",
+    "--no-default-browser-check",
+    "--disable-session-crashed-bubble",
+    "--hide-crash-restore-bubble",
+]
+
 
 # ─────────────────────────── 数据结构 ───────────────────────────
 
@@ -99,21 +113,36 @@ class BossCollector:
                 user_data_dir=self.user_data_dir,
                 headless=self.headless,
                 channel="chrome",
+                args=STEALTH_ARGS,
                 viewport={"width": 1440, "height": 900},
                 locale="zh-CN",
             )
             self._page = self._browser.pages[0] if self._browser.pages else self._browser.new_page()
-            return self._page
-        if self.storage_state and Path(self.storage_state).exists():
-            launch_kwargs["storage_state"] = self.storage_state
-        self._browser = self._pw.chromium.launch(**launch_kwargs)
-        ctx = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context(
-            viewport={"width": 1440, "height": 900},
-            locale="zh-CN",
-            user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
-                        "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
-        )
-        self._page = ctx.new_page()
+        else:
+            if self.storage_state and Path(self.storage_state).exists():
+                launch_kwargs["storage_state"] = self.storage_state
+            self._browser = self._pw.chromium.launch(args=STEALTH_ARGS, **launch_kwargs)
+            ctx = self._browser.contexts[0] if self._browser.contexts else self._browser.new_context(
+                viewport={"width": 1440, "height": 900},
+                locale="zh-CN",
+                user_agent=("Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+                            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0 Safari/537.36"),
+            )
+            self._page = ctx.new_page()
+        # 反 webdriver 检测：在页面任何脚本执行前隐藏自动化特征
+        try:
+            self._page.add_init_script(
+                "Object.defineProperty(navigator, 'webdriver', {get: () => undefined});"
+            )
+        except Exception:
+            pass
+        # 更全面的反指纹（webdriver/plugins/WebGL/languages 等 20+ 项）
+        try:
+            from playwright_stealth import Stealth
+            Stealth().apply_stealth_sync(self._page)
+            logger.info("playwright-stealth 已启用")
+        except Exception as e:
+            logger.debug("stealth 不可用: %s", e)
         return self._page
 
     def close(self):
@@ -166,21 +195,20 @@ class BossCollector:
             self.close()
 
         page = self._ensure_browser()
-        # 1) 打开官网首页（稳定页，无重定向循环）
-        page.goto(f"{BASE_URL}/", timeout=60000, wait_until="domcontentloaded")
-        self._delay(3, 5)
-
-        # 2) 尝试点击页面上的登录入口（若已自动弹出登录弹窗则跳过）
+        # 0) 清理多余标签页，只保留当前页并置前（防止用户看到 about:blank 旧标签）
         try:
-            login_btn = page.query_selector(
-                "a[href*='login'], .login-btn, .btn-login, .login-button, "
-                ".login-panel .btn, [class*='login'] a"
-            )
-            if login_btn:
-                login_btn.click()
-                self._delay(2, 3)
+            ctx = page.context
+            for p in ctx.pages:
+                if p != page:
+                    p.close()
+            page.bring_to_front()
         except Exception:
             pass
+        # 1) 打开固定的登录页 URL（不会按 IP 跳转地区站，页面稳定）
+        #    BOSS 登录页自带完整登录 UI（扫码/验证码/微信），无需额外点击
+        login_url = f"{BASE_URL}/web/user/?ka=header-login"
+        page.goto(login_url, timeout=60000, wait_until="domcontentloaded")
+        self._delay(3, 5)
 
         logger.info("请在打开的浏览器窗口中完成登录（扫码或验证码）...")
         deadline = time.time() + timeout_sec
@@ -195,12 +223,7 @@ class BossCollector:
                     status += " [登录页]"
                 elif page.query_selector(".login-panel, #wrap-login, .login-box"):
                     status += " [登录弹窗]"
-                # BOSS 登录态 cookie 检查
-                cookies = {c["name"]: c.get("value", "")[:8] for c in page.context.cookies()}
-                has_auth_cookie = any(
-                    k in cookies for k in ("__zp_stoken__", "zp_token", "t", "wbg")
-                ) and "login" not in url
-                if self._is_logged_in(page) and has_auth_cookie:
+                if self._is_logged_in(page):
                     # 登录成功：持久化登录态
                     if self.user_data_dir:
                         # persistent profile 已自动保存，无需额外操作
