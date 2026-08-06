@@ -1,0 +1,9 @@
+# 登录态与采集数据（含个人信息，禁止入库）
+storage/
+*.jsonl
+state.json
+
+# Python
+.venv/
+__pycache__/
+*.pyc
